@@ -1,7 +1,6 @@
 """
-Amazon Restock Bot - v2
-Monitorea productos de Amazon y envía alertas por WhatsApp via Twilio.
-Usa requests-html con mejor evasión de detección.
+Amazon Restock Bot - v3
+Usa ScraperAPI para evitar bloqueos de Amazon.
 """
 
 import time
@@ -29,15 +28,11 @@ TWILIO_SID      = os.environ["TWILIO_ACCOUNT_SID"]
 TWILIO_TOKEN    = os.environ["TWILIO_AUTH_TOKEN"]
 TWILIO_WA       = os.environ["TWILIO_WHATSAPP_FROM"]
 MY_WA           = os.environ["MY_WHATSAPP_NUMBER"]
-CHECK_INTERVAL  = int(os.getenv("CHECK_INTERVAL_SECONDS", "600"))  # 10 min
+CHECK_INTERVAL  = int(os.getenv("CHECK_INTERVAL_SECONDS", "600"))
 PRODUCTS_FILE   = Path(os.getenv("PRODUCTS_FILE", "products.json"))
+SCRAPER_KEY     = os.environ["SCRAPER_API_KEY"]
 
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-]
+SCRAPER_URL     = "https://api.scraperapi.com"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -50,55 +45,30 @@ def load_products():
 def save_products(products):
     PRODUCTS_FILE.write_text(json.dumps(products, indent=2, ensure_ascii=False))
 
-def get_session():
-    session = requests.Session()
-    ua = random.choice(USER_AGENTS)
-    session.headers.update({
-        "User-Agent": ua,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "es-MX,es;q=0.8,en-US;q=0.5,en;q=0.3",
-        "Accept-Encoding": "gzip, deflate, br",
-        "DNT": "1",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "none",
-        "Sec-Fetch-User": "?1",
-        "Cache-Control": "max-age=0",
-    })
-    return session
-
 def extract_asin(url: str) -> str:
-    """Extrae el ASIN de una URL de Amazon."""
     import re
     match = re.search(r'/(?:dp|gp/product)/([A-Z0-9]{10})', url)
     return match.group(1) if match else ""
 
 def check_availability(url: str) -> dict:
     asin = extract_asin(url)
-    # Usar URL limpia con el ASIN para evitar parámetros de tracking
     clean_url = f"https://www.amazon.com.mx/dp/{asin}" if asin else url
 
-    session = get_session()
-
-    # Primero visitar la home de Amazon para parecer un navegador real
-    try:
-        session.get("https://www.amazon.com.mx", timeout=10)
-        time.sleep(random.uniform(2, 4))
-    except Exception:
-        pass
+    params = {
+        "api_key": SCRAPER_KEY,
+        "url": clean_url,
+        "country_code": "mx",
+        "device_type": "desktop",
+    }
 
     try:
-        resp = session.get(clean_url, timeout=20)
+        resp = requests.get(SCRAPER_URL, params=params, timeout=60)
         resp.raise_for_status()
     except requests.RequestException as e:
         return {"available": False, "title": "?", "price": "?", "error": str(e)}
 
-    # Detectar si Amazon nos bloqueó (CAPTCHA)
-    if "robot" in resp.text.lower() or "captcha" in resp.text.lower() or len(resp.text) < 5000:
-        log.warning("  ⚠️ Posible bloqueo/CAPTCHA detectado")
-        return {"available": False, "title": "?", "price": "?", "error": "CAPTCHA/blocked"}
+    if len(resp.text) < 3000:
+        return {"available": False, "title": "?", "price": "?", "error": "Respuesta muy corta"}
 
     soup = BeautifulSoup(resp.text, "html.parser")
 
@@ -106,15 +76,14 @@ def check_availability(url: str) -> dict:
     title_el = soup.select_one("#productTitle")
     title = title_el.get_text(strip=True)[:80] if title_el else "Sin título"
 
-    # Precio — múltiples selectores
+    # Precio
     price = None
     for sel in [
         ".a-price .a-offscreen",
         "#priceblock_ourprice",
         "#priceblock_dealprice",
-        ".a-price-whole",
-        "#apex_desktop .a-price .a-offscreen",
         "#corePrice_desktop .a-offscreen",
+        "#apex_desktop .a-price .a-offscreen",
     ]:
         el = soup.select_one(sel)
         if el:
@@ -123,24 +92,21 @@ def check_availability(url: str) -> dict:
     price = price or "Precio no encontrado"
 
     # Disponibilidad
-    add_cart   = soup.select_one("#add-to-cart-button")
-    buy_now    = soup.select_one("#buy-now-button")
-    avail_el   = soup.select_one("#availability span, #outOfStock")
+    add_cart  = soup.select_one("#add-to-cart-button")
+    buy_now   = soup.select_one("#buy-now-button")
+    avail_el  = soup.select_one("#availability span")
     avail_text = avail_el.get_text(strip=True).lower() if avail_el else ""
 
-    out_keywords = ["no disponible", "agotado", "unavailable", "out of stock",
-                    "temporalmente", "no está disponible"]
-    in_keywords  = ["en stock", "disponible", "in stock", "quedan", "en existencia",
-                    "solo queda", "en camino"]
+    out_kw = ["no disponible", "agotado", "unavailable", "out of stock", "temporalmente"]
+    in_kw  = ["en stock", "disponible", "in stock", "quedan", "en existencia"]
 
     if add_cart or buy_now:
         available = True
-    elif any(k in avail_text for k in in_keywords):
+    elif any(k in avail_text for k in in_kw):
         available = True
-    elif any(k in avail_text for k in out_keywords):
+    elif any(k in avail_text for k in out_kw):
         available = False
     else:
-        # Si no hay botón pero tampoco dice "agotado", verificar si hay precio
         available = price != "Precio no encontrado"
 
     return {"available": available, "title": title, "price": price, "error": None}
@@ -165,8 +131,8 @@ def format_alert(product, info, event):
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
 def run():
-    log.info("🤖 Amazon Restock Bot v2 iniciado.")
-    send_whatsapp("🤖 *Amazon Restock Bot v2 activado*\nMonitoreando tus productos Pokémon TCG...")
+    log.info("🤖 Amazon Restock Bot v3 (ScraperAPI) iniciado.")
+    send_whatsapp("🤖 *Amazon Restock Bot v3 activado*\n✅ Ahora usando ScraperAPI — sin bloqueos!")
 
     while True:
         products = load_products()
@@ -179,11 +145,6 @@ def run():
             info        = check_availability(p["url"])
             prev_status = p.get("last_status")
             curr_status = info["available"]
-
-            if info["error"] == "CAPTCHA/blocked":
-                log.warning(f"  Bloqueado por Amazon, esperando más tiempo...")
-                time.sleep(random.uniform(30, 60))
-                continue
 
             if info["error"]:
                 log.warning(f"  Error: {info['error']}")
@@ -205,8 +166,7 @@ def run():
             p["last_title"]   = info["title"]
             changed = True
 
-            # Pausa más larga entre productos para no ser detectado
-            time.sleep(random.uniform(8, 15))
+            time.sleep(random.uniform(3, 6))
 
         if changed:
             save_products(products)
