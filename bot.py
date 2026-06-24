@@ -1,6 +1,8 @@
 """
-Amazon Restock Bot - v3
-Usa ScraperAPI para evitar bloqueos de Amazon.
+Amazon Restock Bot - v5
+- Usa ScraperAPI para evitar bloqueos de Amazon
+- Maneja limite de mensajes de Twilio sin caerse
+- No manda alertas falsas si el producto ya se agotó
 """
 
 import time
@@ -8,14 +10,14 @@ import json
 import logging
 import os
 import random
-from datetime import datetime
+from datetime import datetime, date
 from pathlib import Path
 
 import requests
 from bs4 import BeautifulSoup
 from twilio.rest import Client
+from twilio.base.exceptions import TwilioRestException
 
-# ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -23,18 +25,17 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ── Config ────────────────────────────────────────────────────────────────────
-TWILIO_SID      = os.environ["TWILIO_ACCOUNT_SID"]
-TWILIO_TOKEN    = os.environ["TWILIO_AUTH_TOKEN"]
-TWILIO_WA       = os.environ["TWILIO_WHATSAPP_FROM"]
-MY_WA           = os.environ["MY_WHATSAPP_NUMBER"]
-CHECK_INTERVAL  = int(os.getenv("CHECK_INTERVAL_SECONDS", "600"))
-PRODUCTS_FILE   = Path(os.getenv("PRODUCTS_FILE", "products.json"))
-SCRAPER_KEY     = os.environ["SCRAPER_API_KEY"]
+TWILIO_SID     = os.environ["TWILIO_ACCOUNT_SID"]
+TWILIO_TOKEN   = os.environ["TWILIO_AUTH_TOKEN"]
+TWILIO_WA      = os.environ["TWILIO_WHATSAPP_FROM"]
+MY_WA          = os.environ["MY_WHATSAPP_NUMBER"]
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL_SECONDS", "600"))
+PRODUCTS_FILE  = Path(os.getenv("PRODUCTS_FILE", "products.json"))
+SCRAPER_KEY    = os.environ["SCRAPER_API_KEY"]
+SCRAPER_URL    = "https://api.scraperapi.com"
 
-SCRAPER_URL     = "https://api.scraperapi.com"
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
+messages_blocked_today = False
+blocked_date = None
 
 def load_products():
     if not PRODUCTS_FILE.exists():
@@ -72,11 +73,9 @@ def check_availability(url: str) -> dict:
 
     soup = BeautifulSoup(resp.text, "html.parser")
 
-    # Título
     title_el = soup.select_one("#productTitle")
     title = title_el.get_text(strip=True)[:80] if title_el else "Sin título"
 
-    # Precio
     price = None
     for sel in [
         ".a-price .a-offscreen",
@@ -91,10 +90,9 @@ def check_availability(url: str) -> dict:
             break
     price = price or "Precio no encontrado"
 
-    # Disponibilidad
-    add_cart  = soup.select_one("#add-to-cart-button")
-    buy_now   = soup.select_one("#buy-now-button")
-    avail_el  = soup.select_one("#availability span")
+    add_cart   = soup.select_one("#add-to-cart-button")
+    buy_now    = soup.select_one("#buy-now-button")
+    avail_el   = soup.select_one("#availability span")
     avail_text = avail_el.get_text(strip=True).lower() if avail_el else ""
 
     out_kw = ["no disponible", "agotado", "unavailable", "out of stock", "temporalmente"]
@@ -111,10 +109,28 @@ def check_availability(url: str) -> dict:
 
     return {"available": available, "title": title, "price": price, "error": None}
 
-def send_whatsapp(message: str):
-    client = Client(TWILIO_SID, TWILIO_TOKEN)
-    client.messages.create(body=message, from_=TWILIO_WA, to=MY_WA)
-    log.info("✅ WhatsApp enviado.")
+def send_whatsapp(message: str) -> bool:
+    global messages_blocked_today, blocked_date
+
+    if messages_blocked_today and blocked_date == date.today():
+        return False
+
+    try:
+        client = Client(TWILIO_SID, TWILIO_TOKEN)
+        client.messages.create(body=message, from_=TWILIO_WA, to=MY_WA)
+        log.info("✅ WhatsApp enviado.")
+        messages_blocked_today = False
+        return True
+
+    except TwilioRestException as e:
+        if "63038" in str(e) or "daily messages limit" in str(e).lower() or "429" in str(e):
+            log.warning("⚠️ Límite diario de Twilio alcanzado. Se reintentará mañana.")
+            messages_blocked_today = True
+            blocked_date = date.today()
+            return False
+        else:
+            log.error(f"Error de Twilio: {e}")
+            return False
 
 def format_alert(product, info, event):
     now = datetime.now().strftime("%d/%m/%Y %H:%M")
@@ -128,13 +144,19 @@ def format_alert(product, info, event):
                 f"📦 *{product['name']}*\n"
                 f"🔗 {product['url']}\n\n🕐 {now}")
 
-# ── Main loop ─────────────────────────────────────────────────────────────────
-
 def run():
-    log.info("🤖 Amazon Restock Bot v3 (ScraperAPI) iniciado.")
-    send_whatsapp("🤖 *Amazon Restock Bot v3 activado*\n✅ Ahora usando ScraperAPI — sin bloqueos!")
+    global messages_blocked_today, blocked_date
+
+    log.info("🤖 Amazon Restock Bot v5 iniciado.")
+    send_whatsapp("🤖 *Amazon Restock Bot v5 activo*\n✅ Listo para monitorear tus productos Pokémon TCG")
 
     while True:
+        # Resetear bloqueo si cambió el día
+        if blocked_date and blocked_date != date.today():
+            log.info("🌅 Nuevo día — límite de Twilio reiniciado")
+            messages_blocked_today = False
+            blocked_date = None
+
         products = load_products()
         changed = False
 
@@ -153,12 +175,33 @@ def run():
             status_str = "✅ En stock" if curr_status else "❌ Sin stock"
             log.info(f"  {status_str} — {info['price']}")
 
+            # Solo notificar si HAY stock en este momento
+            # Si el límite de Twilio está activo, marcar como pendiente en el producto
             if prev_status is False and curr_status is True:
-                log.info(f"  🔔 RESTOCK: {name}")
-                send_whatsapp(format_alert(p, info, "restock"))
+                log.info(f"  🔔 RESTOCK detectado: {name}")
+                sent = send_whatsapp(format_alert(p, info, "restock"))
+                if not sent:
+                    # Guardar que tiene alerta pendiente
+                    p["pending_alert"] = "restock"
+                    log.warning(f"  📋 Alerta guardada — se verificará stock antes de enviar mañana")
+                else:
+                    p.pop("pending_alert", None)
+
             elif prev_status is True and curr_status is False:
-                log.info(f"  📴 AGOTADO: {name}")
+                log.info(f"  📴 Se agotó: {name}")
+                p.pop("pending_alert", None)  # Cancelar alerta pendiente si ya se agotó
                 send_whatsapp(format_alert(p, info, "out_of_stock"))
+
+            else:
+                # Verificar si hay alerta pendiente del día anterior
+                if p.get("pending_alert") == "restock" and curr_status is True:
+                    log.info(f"  📤 Enviando alerta pendiente de restock: {name}")
+                    sent = send_whatsapp(format_alert(p, info, "restock"))
+                    if sent:
+                        p.pop("pending_alert", None)
+                elif p.get("pending_alert") == "restock" and curr_status is False:
+                    log.info(f"  ❌ Alerta pendiente cancelada — ya no hay stock: {name}")
+                    p.pop("pending_alert", None)
 
             p["last_status"]  = curr_status
             p["last_checked"] = datetime.now().isoformat()
